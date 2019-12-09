@@ -13,26 +13,28 @@ export default function hash(args: any[]): string {
   let key = 'arg'
   for (let i = 0; i < args.length; ++i) {
     let _hash
-    if (typeof args[i] !== 'object') {
-      // need to consider the case that args[i] is a string:
-      // args[i]        _hash
-      // "undefined" -> '"undefined"'
-      // undefined   -> 'undefined'
-      // 123         -> '123'
-      // null        -> 'null'
-      // "null"      -> '"null"'
-      if (typeof args[i] === 'string') {
-        _hash = '"' + args[i] + '"'
-      } else {
-        _hash = String(args[i])
-      }
-    } else {
-      if (!table.has(args[i])) {
-        _hash = counter
-        table.set(args[i], counter++)
-      } else {
-        _hash = table.get(args[i])
-      }
+    const arg = args[i]
+    switch (typeof arg) {
+      case 'object':
+        if (!table.has(arg)) {
+          _hash = counter
+          table.set(arg, counter++)
+        } else {
+          _hash = table.get(arg)
+        }
+        break
+      case 'string':
+        // need to consider the case that `arg` is a string:
+        // args           _hash
+        // "undefined" -> '"undefined"'
+        // undefined   -> 'undefined'
+        // 123         -> '123'
+        // null        -> 'null'
+        // "null"      -> '"null"'
+        _hash = '"' + arg + '"'
+        break
+      default:
+        _hash = String(arg)
     }
     key += '@' + _hash
   }

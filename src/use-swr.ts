@@ -37,6 +37,9 @@ import throttle from './libs/throttle'
 import hash from './libs/hash'
 
 const IS_SERVER = typeof window === 'undefined'
+const ric = IS_SERVER
+  ? null
+  : window['requestIdleCallback'] || (f => setTimeout(f, 1))
 
 // React currently throws a warning when using useLayoutEffect on the server.
 // To get around it, we can conditionally useEffect on the server (no-op) and
@@ -383,14 +386,10 @@ function useSWR<Data = any, Error = any>(
     const softRevalidate = () => revalidate({ dedupe: true })
 
     // trigger a revalidation
-    if (
-      typeof latestKeyedData !== 'undefined' &&
-      !IS_SERVER &&
-      window['requestIdleCallback']
-    ) {
+    if (typeof latestKeyedData !== 'undefined' && !IS_SERVER && ric) {
       // delay revalidate if there's cache
       // to not block the rendering
-      window['requestIdleCallback'](softRevalidate)
+      ric(softRevalidate)
     } else {
       softRevalidate()
     }
