@@ -92,7 +92,8 @@ if (typeof window !== 'undefined' && window.addEventListener && !eventsBinded) {
     if (!isDocumentVisible() || !isOnline()) return
 
     for (let key in FOCUS_REVALIDATORS) {
-      if (FOCUS_REVALIDATORS[key][0]) FOCUS_REVALIDATORS[key][0]()
+      const first = FOCUS_REVALIDATORS[key].values().next()
+      if (first.value) first.value()
     }
   }
   window.addEventListener('visibilitychange', revalidate, false)

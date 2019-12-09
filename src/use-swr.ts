@@ -79,18 +79,18 @@ const trigger: triggerInterface = (_key, shouldRevalidate = true) => {
   if (key && updaters) {
     const currentData = cacheGet(key)
     const currentError = cacheGet(getErrorKey(key))
-    for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](shouldRevalidate, currentData, currentError, true)
-    }
+    updaters.forEach(updater => {
+      updater(shouldRevalidate, currentData, currentError, true)
+    })
   }
 }
 
 const broadcastState: broadcastStateInterface = (key, data, error) => {
   const updaters = CACHE_REVALIDATORS[key]
   if (key && updaters) {
-    for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](false, data, error)
-    }
+    updaters.forEach(updater => {
+      updater(false, data, error)
+    })
   }
 }
 
@@ -128,9 +128,9 @@ const mutate: mutateInterface = async (_key, _data, shouldRevalidate) => {
   // update existing SWR Hooks' state
   const updaters = CACHE_REVALIDATORS[key]
   if (updaters) {
-    for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](!!shouldRevalidate, data, error, true)
-    }
+    updaters.forEach(updater => {
+      updater(!!shouldRevalidate, data, error, true)
+    })
   }
 }
 
@@ -401,9 +401,9 @@ function useSWR<Data = any, Error = any>(
       // and tabs being switched quickly
       onFocus = throttle(softRevalidate, config.focusThrottleInterval)
       if (!FOCUS_REVALIDATORS[key]) {
-        FOCUS_REVALIDATORS[key] = [onFocus]
+        FOCUS_REVALIDATORS[key] = new Set([onFocus])
       } else {
-        FOCUS_REVALIDATORS[key].push(onFocus)
+        FOCUS_REVALIDATORS[key].add(onFocus)
       }
     }
 
@@ -447,9 +447,9 @@ function useSWR<Data = any, Error = any>(
 
     // add updater to listeners
     if (!CACHE_REVALIDATORS[key]) {
-      CACHE_REVALIDATORS[key] = [onUpdate]
+      CACHE_REVALIDATORS[key] = new Set([onUpdate])
     } else {
-      CACHE_REVALIDATORS[key].push(onUpdate)
+      CACHE_REVALIDATORS[key].add(onUpdate)
     }
 
     // set up polling
@@ -481,21 +481,11 @@ function useSWR<Data = any, Error = any>(
 
       if (onFocus && FOCUS_REVALIDATORS[key]) {
         const revalidators = FOCUS_REVALIDATORS[key]
-        const index = revalidators.indexOf(onFocus)
-        if (index >= 0) {
-          // 10x faster than splice
-          // https://jsperf.com/array-remove-by-index
-          revalidators[index] = revalidators[revalidators.length - 1]
-          revalidators.pop()
-        }
+        revalidators.delete(onFocus)
       }
       if (CACHE_REVALIDATORS[key]) {
         const revalidators = CACHE_REVALIDATORS[key]
-        const index = revalidators.indexOf(onUpdate)
-        if (index >= 0) {
-          revalidators[index] = revalidators[revalidators.length - 1]
-          revalidators.pop()
-        }
+        revalidators.delete(onUpdate)
       }
 
       if (timeout !== null) {
