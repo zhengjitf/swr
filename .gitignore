@@ -7,5 +7,6 @@ esm
 .next
 .DS_Store
 .idea
+.rts*
 examples/**/yarn.lock
 package-lock.json
