@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import React, { useState } from 'react'
-import useSWR, { cache } from '../src'
+import useSWR, { createCache, SWRConfig } from 'swr'
 import { sleep } from './utils'
 
 // This has to be an async function to wait a microtask to flush updates
@@ -9,10 +9,10 @@ const advanceTimers = async (ms: number) => jest.advanceTimersByTime(ms)
 // This test heavily depends on setInterval/setTimeout timers, which makes tests slower and flaky.
 // So we use Jest's fake timers
 describe('useSWR - refresh', () => {
-  beforeEach(() => {
+  beforeAll(() => {
     jest.useFakeTimers()
   })
-  afterEach(() => {
+  afterAll(() => {
     jest.useRealTimers()
   })
   it('should rerender automatically on interval', async () => {
@@ -224,7 +224,13 @@ describe('useSWR - refresh', () => {
       return <button onClick={() => change()}>{data.timestamp}</button>
     }
 
-    render(<Page />)
+    const customCache = new Map()
+    const { cache } = createCache(customCache)
+    render(
+      <SWRConfig value={{ cache }}>
+        <Page />
+      </SWRConfig>
+    )
 
     screen.getByText('loading')
 
@@ -243,7 +249,7 @@ describe('useSWR - refresh', () => {
       version: '1.0'
     })
 
-    const cachedData = cache.get(key)
+    const cachedData = customCache.get(key)
     expect(cachedData.timestamp.toString()).toEqual('1')
     screen.getByText('1')
   })
@@ -298,7 +304,7 @@ describe('useSWR - refresh', () => {
     expect(fetcherWithToken).toHaveBeenLastCalledWith('1')
   })
 
-  it('the previous interval timer should not call onSuccess callback if key changes too fast', async () => {
+  it('should not call onSuccess from the previous interval if key has changed', async () => {
     const fetcherWithToken = jest.fn(async token => {
       await sleep(100)
       return token

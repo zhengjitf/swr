@@ -1,12 +1,13 @@
-// TODO: use @ts-expect-error
 import { useCallback, useRef, useDebugValue } from 'react'
-
-import defaultConfig, { cache } from './config'
-import { IS_SERVER, rAF, useIsomorphicLayoutEffect } from './env'
-import SWRConfigContext from './config-context'
-import useStateWithDeps from './state'
-import useArgs from './resolve-args'
-
+import defaultConfig from './utils/config'
+import { provider as defaultProvider } from './utils/web-preset'
+import { wrapCache } from './utils/cache'
+import { IS_SERVER, rAF, useIsomorphicLayoutEffect } from './utils/env'
+import { serialize } from './utils/serialize'
+import { isUndefined, UNDEFINED } from './utils/helper'
+import ConfigProvider from './utils/config-context'
+import useStateWithDeps from './utils/state'
+import withArgs from './utils/resolve-args'
 import {
   State,
   Broadcaster,
@@ -15,99 +16,100 @@ import {
   MutatorCallback,
   SWRResponse,
   RevalidatorOptions,
-  Trigger,
   Updater,
-  SWRConfiguration
+  Configuration,
+  SWRConfiguration,
+  Cache,
+  ScopedMutator,
+  SWRHook,
+  ProviderOptions
 } from './types'
 
 type Revalidator = (...args: any[]) => void
 
-// Global states
-const CONCURRENT_PROMISES: Record<string, any> = {}
-const CONCURRENT_PROMISES_TS: Record<string, number> = {}
-const FOCUS_REVALIDATORS: Record<string, Revalidator[]> = {}
-const RECONNECT_REVALIDATORS: Record<string, Revalidator[]> = {}
-const CACHE_REVALIDATORS: Record<string, Updater[]> = {}
-const MUTATION_TS: Record<string, number> = {}
-const MUTATION_END_TS: Record<string, number> = {}
+// Generate strictly increasing timestamps.
+let __timestamp = 0
 
-// Generate strictly increasing timestamps
-const now = (() => {
-  let ts = 0
-  return () => ++ts
-})()
+// Global state used to deduplicate requests and store listeners
+const SWRGlobalState = new WeakMap<Cache, any>()
+const getGlobalState = (cache: Cache) => {
+  if (!SWRGlobalState.has(cache)) {
+    SWRGlobalState.set(cache, [{}, {}, {}, {}, {}, {}, {}])
+  }
+  return SWRGlobalState.get(cache) as [
+    Record<string, Revalidator[]>, // FOCUS_REVALIDATORS
+    Record<string, Revalidator[]>, // RECONNECT_REVALIDATORS
+    Record<string, Updater[]>, // CACHE_REVALIDATORS
+    Record<string, number>, // MUTATION_TS
+    Record<string, number>, // MUTATION_END_TS
+    Record<string, any>, // CONCURRENT_PROMISES
+    Record<string, number> // CONCURRENT_PROMISES_TS
+  ]
+}
 
-// Setup DOM events listeners for `focus` and `reconnect` actions
-if (!IS_SERVER) {
+function setupGlobalEvents(cache: Cache, _opts: Partial<ProviderOptions> = {}) {
+  if (IS_SERVER) return
+  const opts = { ...defaultProvider, ..._opts }
+  const [FOCUS_REVALIDATORS, RECONNECT_REVALIDATORS] = getGlobalState(cache)
   const revalidate = (revalidators: Record<string, Revalidator[]>) => {
-    if (!defaultConfig.isDocumentVisible() || !defaultConfig.isOnline()) return
-
     for (const key in revalidators) {
       if (revalidators[key][0]) revalidators[key][0]()
     }
   }
 
-  if (typeof defaultConfig.registerOnFocus === 'function') {
-    defaultConfig.registerOnFocus(() => revalidate(FOCUS_REVALIDATORS))
-  }
-
-  if (typeof defaultConfig.registerOnReconnect === 'function') {
-    defaultConfig.registerOnReconnect(() => revalidate(RECONNECT_REVALIDATORS))
-  }
+  opts.setupOnFocus(() => revalidate(FOCUS_REVALIDATORS))
+  opts.setupOnReconnect(() => revalidate(RECONNECT_REVALIDATORS))
 }
 
-const trigger: Trigger = (_key, shouldRevalidate = true) => {
-  // we are ignoring the second argument which correspond to the arguments
-  // the fetcher will receive when key is an array
-  const [key, , keyErr, keyValidating] = cache.serializeKey(_key)
-  if (!key) return Promise.resolve()
+// Setup DOM events listeners for `focus` and `reconnect` actions
+setupGlobalEvents(defaultConfig.cache)
 
+const broadcastState: Broadcaster = (
+  cache: Cache,
+  key,
+  data,
+  error,
+  isValidating,
+  shouldRevalidate = false
+) => {
+  const [, , CACHE_REVALIDATORS] = getGlobalState(cache)
   const updaters = CACHE_REVALIDATORS[key]
-
-  if (key && updaters) {
-    const currentData = cache.get(key)
-    const currentError = cache.get(keyErr)
-    const currentIsValidating = cache.get(keyValidating)
-    const promises = []
+  const promises = []
+  if (updaters) {
     for (let i = 0; i < updaters.length; ++i) {
       promises.push(
-        updaters[i](
-          shouldRevalidate,
-          currentData,
-          currentError,
-          currentIsValidating,
-          i > 0
-        )
+        updaters[i](shouldRevalidate, data, error, isValidating, i > 0)
       )
     }
-    // return new updated value
-    return Promise.all(promises).then(() => cache.get(key))
   }
-  return Promise.resolve(cache.get(key))
+  return Promise.all(promises).then(() => cache.get(key))
 }
 
-const broadcastState: Broadcaster = (key, data, error, isValidating) => {
-  const updaters = CACHE_REVALIDATORS[key]
-  if (key && updaters) {
-    for (let i = 0; i < updaters.length; ++i) {
-      updaters[i](false, data, error, isValidating)
-    }
-  }
-}
-
-async function mutate<Data = any>(
+async function internalMutate<Data = any>(
+  cache: Cache,
   _key: Key,
   _data?: Data | Promise<Data | undefined> | MutatorCallback<Data>,
   shouldRevalidate = true
 ): Promise<Data | undefined> {
-  const [key, , keyErr] = cache.serializeKey(_key)
-  if (!key) return undefined
+  const [key, , keyErr] = serialize(_key)
+  if (!key) return UNDEFINED
+
+  const [, , , MUTATION_TS, MUTATION_END_TS] = getGlobalState(cache)
 
   // if there is no new data to update, let's just revalidate the key
-  if (typeof _data === 'undefined') return trigger(_key, shouldRevalidate)
+  if (isUndefined(_data)) {
+    return broadcastState(
+      cache,
+      key,
+      cache.get(key),
+      cache.get(keyErr),
+      UNDEFINED,
+      shouldRevalidate
+    )
+  }
 
   // update global timestamps
-  MUTATION_TS[key] = now() - 1
+  MUTATION_TS[key] = ++__timestamp
   MUTATION_END_TS[key] = 0
 
   // track timestamps before await asynchronously
@@ -122,7 +124,7 @@ async function mutate<Data = any>(
       _data = (_data as MutatorCallback<Data>)(cache.get(key))
     } catch (err) {
       // if `_data` function throws an error synchronously, it shouldn't be cached
-      _data = undefined
+      _data = UNDEFINED
       error = err
     }
   }
@@ -147,45 +149,41 @@ async function mutate<Data = any>(
     }
   }
 
-  // if there's a race we don't update cache or broadcast change, just return the data
+  // If there's a race we don't update cache or broadcast change, just return the data
   if (shouldAbort()) return data
 
-  if (data !== undefined) {
+  if (!isUndefined(data)) {
     // update cached data
     cache.set(key, data)
   }
-  // always update or reset the error
+  // Always update or reset the error
   cache.set(keyErr, error)
 
-  // reset the timestamp to mark the mutation has ended
-  MUTATION_END_TS[key] = now() - 1
+  // Reset the timestamp to mark the mutation has ended
+  MUTATION_END_TS[key] = ++__timestamp
 
   if (!isAsyncMutation) {
-    // we skip broadcasting if there's another mutation happened synchronously
+    // We skip broadcasting if there's another mutation happened synchronously
     if (shouldAbort()) return data
   }
 
-  // enter the revalidation stage
-  // update existing SWR Hooks' state
-  const updaters = CACHE_REVALIDATORS[key]
-  if (updaters) {
-    const promises = []
-    for (let i = 0; i < updaters.length; ++i) {
-      promises.push(
-        updaters[i](!!shouldRevalidate, data, error, undefined, i > 0)
-      )
-    }
-    // return new updated value
-    return Promise.all(promises).then(() => {
-      if (error) throw error
-      return cache.get(key)
-    })
-  }
-  // throw error or return data to be used by caller of mutate
-  if (error) throw error
-  return data
+  // Update existing SWR Hooks' internal states:
+  return broadcastState(
+    cache,
+    key,
+    data,
+    error,
+    UNDEFINED,
+    shouldRevalidate
+  ).then(res => {
+    // Throw error or return data
+    if (error) throw error
+    return res
+  })
 }
 
+// Add a callback function to a list of keyed revalidation functions and returns
+// the unregister function.
 const addRevalidator = (
   revalidators: Record<string, Revalidator[]>,
   key: string,
@@ -209,57 +207,65 @@ const addRevalidator = (
   }
 }
 
-function useSWR<Data = any, Error = any>(
-  ...args:
-    | readonly [Key]
-    | readonly [Key, Fetcher<Data> | null]
-    | readonly [Key, SWRConfiguration<Data, Error> | undefined]
-    | readonly [
-        Key,
-        Fetcher<Data> | null,
-        SWRConfiguration<Data, Error> | undefined
-      ]
+export function useSWRHandler<Data = any, Error = any>(
+  _key: Key,
+  fn: Fetcher<Data> | null,
+  config: typeof defaultConfig & SWRConfiguration<Data, Error>
 ): SWRResponse<Data, Error> {
-  const [_key, config, fn] = useArgs<Key, SWRConfiguration<Data, Error>, Data>(
-    args
-  )
+  const {
+    cache,
+    compare,
+    initialData,
+    suspense,
+    revalidateOnMount,
+    revalidateWhenStale,
+    refreshInterval,
+    refreshWhenHidden,
+    refreshWhenOffline
+  } = config
+  const [
+    FOCUS_REVALIDATORS,
+    RECONNECT_REVALIDATORS,
+    CACHE_REVALIDATORS,
+    MUTATION_TS,
+    MUTATION_END_TS,
+    CONCURRENT_PROMISES,
+    CONCURRENT_PROMISES_TS
+  ] = getGlobalState(cache)
 
   // `key` is the identifier of the SWR `data` state.
-  // `keyErr` and `keyValidating` are indentifiers of `error` and `isValidating`
+  // `keyErr` and `keyValidating` are identifiers of `error` and `isValidating`
   // which are derived from `key`.
   // `fnArgs` is a list of arguments for `fn`.
-  const [key, fnArgs, keyErr, keyValidating] = cache.serializeKey(_key)
-
-  const configRef = useRef(config)
-  useIsomorphicLayoutEffect(() => {
-    configRef.current = config
-  })
+  const [key, fnArgs, keyErr, keyValidating] = serialize(_key)
 
   // If it's the first render of this hook.
   const initialMountedRef = useRef(false)
-
-  // error ref inside revalidate (is last request errored?)
   const unmountedRef = useRef(false)
+
+  // The ref to trace the current key.
   const keyRef = useRef(key)
+  const configRef = useRef(config)
 
   // Get the current state that SWR should return.
   const resolveData = () => {
     const cachedData = cache.get(key)
-    return cachedData === undefined ? config.initialData : cachedData
+    return isUndefined(cachedData) ? initialData : cachedData
   }
   const data = resolveData()
   const error = cache.get(keyErr)
 
   // A revalidation must be triggered when mounted if:
   // - `revalidateOnMount` is explicitly set to `true`.
-  // - Suspense mode and there's stale data for the inital render.
-  // - Not suspense mode and there is no `initialData`.
+  // - Suspense mode and there's stale data for the initial render.
+  // - Not suspense mode and there is no `initialData` and `revalidateWhenStale` is enabled.
+  // - `revalidateWhenStale` is enabled but `data` is not defined.
   const shouldRevalidateOnMount = () => {
-    if (config.revalidateOnMount !== undefined) return config.revalidateOnMount
+    if (!isUndefined(revalidateOnMount)) return revalidateOnMount
 
-    return config.suspense
-      ? !initialMountedRef.current && data !== undefined
-      : config.initialData === undefined
+    return suspense
+      ? !initialMountedRef.current && !isUndefined(data)
+      : isUndefined(initialData) && (revalidateWhenStale || isUndefined(data))
   }
 
   // Resolve the current validating state.
@@ -271,18 +277,6 @@ function useSWR<Data = any, Error = any>(
     return !initialMountedRef.current && shouldRevalidateOnMount()
   }
   const isValidating = resolveValidating()
-
-  // do unmount check for callbacks
-  // if key changed during the revalidation, old dispatch and config callback should not take effect.
-  const safeCallback = useCallback(
-    (callback: () => void) => {
-      if (unmountedRef.current) return
-      if (key !== keyRef.current) return
-      if (!initialMountedRef.current) return
-      callback()
-    },
-    [key]
-  )
 
   const [stateRef, stateDependenciesRef, setState] = useStateWithDeps<
     Data,
@@ -300,14 +294,23 @@ function useSWR<Data = any, Error = any>(
   // `fetcher`, to correctly handle the many edge cases.
   const revalidate = useCallback(
     async (revalidateOpts: RevalidatorOptions = {}): Promise<boolean> => {
-      if (!key || !fn) return false
-      if (unmountedRef.current) return false
-      if (configRef.current.isPaused()) return false
-      const { retryCount = 0, dedupe = false } = revalidateOpts
+      if (!key || !fn || unmountedRef.current || configRef.current.isPaused()) {
+        return false
+      }
+
+      const { retryCount, dedupe } = revalidateOpts
 
       let loading = true
-      let shouldDeduping =
-        typeof CONCURRENT_PROMISES[key] !== 'undefined' && dedupe
+      const shouldDeduping = !isUndefined(CONCURRENT_PROMISES[key]) && dedupe
+
+      // Do unmount check for callbacks:
+      // If key has changed during the revalidation, or the component has been
+      // unmounted, old dispatch and old event callbacks should not take any
+      // effect.
+      const isCallbackSafe = () =>
+        !unmountedRef.current &&
+        key === keyRef.current &&
+        initialMountedRef.current
 
       // start fetching
       try {
@@ -318,6 +321,7 @@ function useSWR<Data = any, Error = any>(
         if (!shouldDeduping) {
           // also update other hooks
           broadcastState(
+            cache,
             key,
             stateRef.current.data,
             stateRef.current.error,
@@ -329,27 +333,22 @@ function useSWR<Data = any, Error = any>(
         let startAt: number
 
         if (shouldDeduping) {
-          // there's already an ongoing request,
-          // this one needs to be deduplicated.
+          // There's already an ongoing request, this one needs to be
+          // deduplicated.
           startAt = CONCURRENT_PROMISES_TS[key]
           newData = await CONCURRENT_PROMISES[key]
         } else {
-          // if no cache being rendered currently (it shows a blank page),
+          // If no cache being rendered currently (it shows a blank page),
           // we trigger the loading slow event.
           if (config.loadingTimeout && !cache.get(key)) {
             setTimeout(() => {
-              if (loading)
-                safeCallback(() => configRef.current.onLoadingSlow(key, config))
+              if (loading && isCallbackSafe())
+                configRef.current.onLoadingSlow(key, config)
             }, config.loadingTimeout)
           }
 
-          if (fnArgs !== null) {
-            CONCURRENT_PROMISES[key] = fn(...fnArgs)
-          } else {
-            CONCURRENT_PROMISES[key] = fn(key)
-          }
-
-          CONCURRENT_PROMISES_TS[key] = startAt = now()
+          CONCURRENT_PROMISES[key] = fn(...fnArgs)
+          CONCURRENT_PROMISES_TS[key] = startAt = ++__timestamp
 
           newData = await CONCURRENT_PROMISES[key]
 
@@ -363,7 +362,8 @@ function useSWR<Data = any, Error = any>(
 
           // trigger the success event,
           // only do this for the original request.
-          safeCallback(() => configRef.current.onSuccess(newData, key, config))
+          if (isCallbackSafe())
+            configRef.current.onSuccess(newData, key, config)
         }
 
         // if there're other ongoing request(s), started after the current one,
@@ -389,7 +389,7 @@ function useSWR<Data = any, Error = any>(
         // we have to ignore the revalidation result (res) because it's no longer fresh.
         // meanwhile, a new revalidation should be triggered when the mutation ends.
         if (
-          MUTATION_TS[key] !== undefined &&
+          !isUndefined(MUTATION_TS[key]) &&
           // case 1
           (startAt <= MUTATION_TS[key] ||
             // case 2
@@ -401,25 +401,25 @@ function useSWR<Data = any, Error = any>(
           return false
         }
 
-        cache.set(keyErr, undefined)
+        cache.set(keyErr, UNDEFINED)
         cache.set(keyValidating, false)
 
         const newState: State<Data, Error> = {
           isValidating: false
         }
 
-        if (stateRef.current.error !== undefined) {
-          newState.error = undefined
+        if (!isUndefined(stateRef.current.error)) {
+          newState.error = UNDEFINED
         }
 
         // Deep compare with latest state to avoid extra re-renders.
         // For local state, compare and assign.
-        if (!config.compare(stateRef.current.data, newData)) {
+        if (!compare(stateRef.current.data, newData)) {
           newState.data = newData
         }
         // For global state, it's possible that the key has changed.
         // https://github.com/vercel/swr/pull/1058
-        if (!config.compare(cache.get(key), newData)) {
+        if (!compare(cache.get(key), newData)) {
           cache.set(key, newData)
         }
 
@@ -428,7 +428,7 @@ function useSWR<Data = any, Error = any>(
 
         if (!shouldDeduping) {
           // also update other hooks
-          broadcastState(key, newData, newState.error, false)
+          broadcastState(cache, key, newData, newState.error, false)
         }
       } catch (err) {
         delete CONCURRENT_PROMISES[key]
@@ -452,20 +452,20 @@ function useSWR<Data = any, Error = any>(
           })
           if (!shouldDeduping) {
             // also broadcast to update other hooks
-            broadcastState(key, undefined, err, false)
+            broadcastState(cache, key, UNDEFINED, err, false)
           }
         }
 
-        // events and retry
-        safeCallback(() => configRef.current.onError(err, key, config))
-        if (config.shouldRetryOnError) {
-          // when retrying, we always enable deduping
-          safeCallback(() =>
+        // Error event and retry logic.
+        if (isCallbackSafe()) {
+          configRef.current.onError(err, key, config)
+          if (config.shouldRetryOnError) {
+            // When retrying, dedupe is always enabled
             configRef.current.onErrorRetry(err, key, config, revalidate, {
-              retryCount: retryCount + 1,
+              retryCount: (retryCount || 0) + 1,
               dedupe: true
             })
-          )
+          }
         }
       }
 
@@ -486,12 +486,18 @@ function useSWR<Data = any, Error = any>(
     [key]
   )
 
+  // Always update config.
+  useIsomorphicLayoutEffect(() => {
+    configRef.current = config
+  })
+
   // After mounted or key changed.
   useIsomorphicLayoutEffect(() => {
-    if (!key) return undefined
+    if (!key) return UNDEFINED
 
-    // Not the inital render.
+    // Not the initial render.
     const keyChanged = initialMountedRef.current
+    const softRevalidate = () => revalidate({ dedupe: true })
 
     // Mark the component as mounted and update corresponding refs.
     unmountedRef.current = false
@@ -507,40 +513,41 @@ function useSWR<Data = any, Error = any>(
       })
     }
 
-    const softRevalidate = () => revalidate({ dedupe: true })
-
     // Trigger a revalidation.
     if (keyChanged || shouldRevalidateOnMount()) {
-      if (data !== undefined && !IS_SERVER) {
+      if (isUndefined(data) || IS_SERVER) {
+        // Revalidate immediately.
+        softRevalidate()
+      } else {
         // Delay the revalidate if we have data to return so we won't block
         // rendering.
-        // @ts-ignore it's safe to use requestAnimationFrame in browser
         rAF(softRevalidate)
-      } else {
-        softRevalidate()
       }
     }
 
-    // Add event listeners
+    const isVisible = () =>
+      configRef.current.isDocumentVisible() && configRef.current.isOnline()
 
+    // Add event listeners.
     let pending = false
     const onFocus = () => {
-      if (pending || !configRef.current.revalidateOnFocus) return
-      pending = true
-      softRevalidate()
-      setTimeout(
-        () => (pending = false),
-        configRef.current.focusThrottleInterval
-      )
+      if (configRef.current.revalidateOnFocus && !pending && isVisible()) {
+        pending = true
+        softRevalidate()
+        setTimeout(
+          () => (pending = false),
+          configRef.current.focusThrottleInterval
+        )
+      }
     }
 
     const onReconnect = () => {
-      if (configRef.current.revalidateOnReconnect) {
+      if (configRef.current.revalidateOnReconnect && isVisible()) {
         softRevalidate()
       }
     }
 
-    // register global cache update listener
+    // Register global cache update listener.
     const onUpdate: Updater<Data, Error> = (
       shouldRevalidate = true,
       updatedData,
@@ -552,7 +559,7 @@ function useSWR<Data = any, Error = any>(
         error: updatedError,
         isValidating: updatedIsValidating,
         // if data is undefined we should not update stateRef.current.data
-        ...(!config.compare(updatedData, stateRef.current.data)
+        ...(!compare(updatedData, stateRef.current.data)
           ? {
               data: updatedData
             }
@@ -573,7 +580,7 @@ function useSWR<Data = any, Error = any>(
     initialMountedRef.current = true
 
     return () => {
-      // mark it as unmounted
+      // Mark it as unmounted.
       unmountedRef.current = true
 
       unsubFocus()
@@ -584,103 +591,122 @@ function useSWR<Data = any, Error = any>(
 
   // Polling
   useIsomorphicLayoutEffect(() => {
-    let timer: any = null
-    const tick = async () => {
+    let timer: any = 0
+
+    function nextTick() {
+      if (refreshInterval) {
+        timer = setTimeout(tick, refreshInterval)
+      }
+    }
+
+    async function tick() {
       if (
         !stateRef.current.error &&
-        (configRef.current.refreshWhenHidden ||
-          configRef.current.isDocumentVisible()) &&
-        (configRef.current.refreshWhenOffline || configRef.current.isOnline())
+        (refreshWhenHidden || config.isDocumentVisible()) &&
+        (refreshWhenOffline || config.isOnline())
       ) {
         // only revalidate when the page is visible
         // if API request errored, we stop polling in this round
         // and let the error retry function handle it
         await revalidate({ dedupe: true })
       }
+
       // Read the latest refreshInterval
-      if (configRef.current.refreshInterval && timer) {
-        timer = setTimeout(tick, configRef.current.refreshInterval)
-      }
+      if (timer) nextTick()
     }
-    if (configRef.current.refreshInterval) {
-      timer = setTimeout(tick, configRef.current.refreshInterval)
-    }
+
+    nextTick()
+
     return () => {
       if (timer) {
         clearTimeout(timer)
-        timer = null
+        timer = 0
       }
     }
-  }, [
-    config.refreshInterval,
-    config.refreshWhenHidden,
-    config.refreshWhenOffline,
-    revalidate
-  ])
+  }, [refreshInterval, refreshWhenHidden, refreshWhenOffline, revalidate])
 
   // In Suspense mode, we can't return the empty `data` state.
   // If there is `error`, the `error` needs to be thrown to the error boundary.
   // If there is no `error`, the `revalidation` promise needs to be thrown to
   // the suspense boundary.
-  if (config.suspense && data === undefined) {
-    if (error === undefined) {
-      throw revalidate({ dedupe: true })
-    }
-    throw error
+  if (suspense && isUndefined(data)) {
+    throw isUndefined(error) ? revalidate({ dedupe: true }) : error
   }
 
   // `mutate`, but bound to the current key.
   const boundMutate: SWRResponse<Data, Error>['mutate'] = useCallback(
     (newData, shouldRevalidate) => {
-      return mutate(keyRef.current, newData, shouldRevalidate)
+      return internalMutate(cache, keyRef.current, newData, shouldRevalidate)
     },
+    // `cache` isn't allowed to change during the lifecycle
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     []
   )
+
+  // Display debug info in React DevTools.
+  useDebugValue(data)
+
+  const currentStateDependencies = stateDependenciesRef.current
 
   // Define the SWR state.
   // `revalidate` will be deprecated in the 1.x release
   // because `mutate()` covers the same use case of `revalidate()`.
   // This remains only for backward compatibility
-  const state = {
-    revalidate,
-    mutate: boundMutate
-  } as SWRResponse<Data, Error>
-  Object.defineProperties(state, {
-    data: {
-      get: function() {
-        stateDependenciesRef.current.data = true
-        return data
-      },
-      enumerable: true
+  return Object.defineProperties(
+    {
+      revalidate,
+      mutate: boundMutate
     },
-    error: {
-      get: function() {
-        stateDependenciesRef.current.error = true
-        return error
+    {
+      data: {
+        get: function() {
+          currentStateDependencies.data = true
+          return data
+        },
+        enumerable: true
       },
-      enumerable: true
-    },
-    isValidating: {
-      get: function() {
-        stateDependenciesRef.current.isValidating = true
-        return isValidating
+      error: {
+        get: function() {
+          currentStateDependencies.error = true
+          return error
+        },
+        enumerable: true
       },
-      enumerable: true
+      isValidating: {
+        get: function() {
+          currentStateDependencies.isValidating = true
+          return isValidating
+        },
+        enumerable: true
+      }
     }
-  })
-
-  // Display debug info in React DevTools.
-  useDebugValue(data)
-
-  return state
+  ) as SWRResponse<Data, Error>
 }
 
-Object.defineProperty(SWRConfigContext.Provider, 'default', {
+export const SWRConfig = Object.defineProperty(ConfigProvider, 'default', {
   value: defaultConfig
-})
-const SWRConfig = SWRConfigContext.Provider as typeof SWRConfigContext.Provider & {
-  default: SWRConfiguration
+}) as typeof ConfigProvider & {
+  default: Configuration
 }
 
-export { trigger, mutate, SWRConfig }
-export default useSWR
+export const mutate = internalMutate.bind(
+  null,
+  defaultConfig.cache
+) as ScopedMutator
+
+export function createCache<Data>(
+  provider: Cache,
+  options?: Partial<ProviderOptions>
+): {
+  cache: Cache
+  mutate: ScopedMutator<Data>
+} {
+  const cache = wrapCache<Data>(provider)
+  setupGlobalEvents(cache, options)
+  return {
+    cache,
+    mutate: internalMutate.bind(null, cache) as ScopedMutator<Data>
+  }
+}
+
+export default withArgs<SWRHook>(useSWRHandler)
